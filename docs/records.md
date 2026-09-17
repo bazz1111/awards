@@ -65,12 +65,13 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python scripts/manage.py validate
 python scripts/manage.py links
+python scripts/manage.py problems
 python scripts/manage.py build
 python scripts/manage.py check
 python -m unittest discover -s tests -v
 ```
 
-`validate` checks source schemas and cross-file business constraints. `links` checks local Markdown file links, reference links, images and heading anchors. External URL availability and raw HTML links are outside this offline check. `build` validates and writes deterministic `data/*.json`; `check` compares the committed files with regeneration without modifying them. No timestamps or machine-local paths enter the generated data.
+`validate` checks source schemas and cross-file business constraints. `links` checks local Markdown file links, reference links, images and heading anchors. External URL availability and raw HTML links are outside this offline check. `problems` checks the problem bank index in `problems/README.md` against the volume catalogs: consecutive numbering, anchors, links, titles, the status vocabulary and the credited status shape, eligibility and claim status, and the counts the index states about itself. The test suite runs the same check against the committed bank, so drift between the index and its catalogs fails CI. `build` validates and writes deterministic `data/*.json`; `check` compares the committed files with regeneration without modifying them. No timestamps or machine-local paths enter the generated data.
 
 `python scripts/manage.py history --base <full-commit-sha>` compares published decisions, statements and retained award history with a Git base revision. CI runs this on PRs and pushes with an available base, using full history. It compares snapshots; reviewers must still check intermediate commits for private information and confirm business event dates.
 

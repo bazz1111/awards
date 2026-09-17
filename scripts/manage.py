@@ -20,6 +20,43 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_BASE = "https://schemas.example.invalid/awards/"
 ROLES = {"recipients": "recipient", "curators": "curator", "verifiers": "verifier"}
 
+PROBLEM_INDEX = "problems/README.md"
+# CONTRIBUTING.md fixes the vocabulary: "Use only Open or Solved as the status;
+# record complete-solution credits in the same Current status field after
+# Proof contributors:".  Partial progress is explicitly not submittable, so the
+# closed set is the two values the policy names rather than a third that the
+# repository no longer publishes.
+PROBLEM_STATUS = ("Open", "Solved")
+PROBLEM_ELIGIBLE = ("Yes", "No", "Pending verification")
+PROBLEM_CLAIM = ("Unavailable", "Unclaimed", "Claimed")
+# The fixed marker CONTRIBUTING.md requires for solver credits in that field.
+PROBLEM_PROOF_CREDITS = "<br>Proof contributors:"
+PROBLEM_ID = re.compile(r"JSP-\d{6}")
+PROBLEM_HEADING = re.compile(r"^## (JSP-\d{6}) · (.+?)\s*$")
+PROBLEM_ANCHOR = re.compile(r'^<a id="(JSP-\d{6})"></a>$')
+PROBLEM_RANGE = re.compile(r"^(\d+)[–-](\d+)$")
+PROBLEM_LINK = re.compile(r"^\[(.+)\]\(([^)#\s]+)#(JSP-\d{6})\)$")
+PROBLEM_FILE = re.compile(r"^\[([^\]]+)\]\(([^)\s]+)\)$")
+# The counts the index states about itself. Reading them from the prose keeps
+# the check on the documented promise instead of on a second copy of the
+# number, so a curator who edits the claim is held to it.
+PROBLEM_CLAIMS = {
+    "problems": re.compile(r"contains \*\*([\d,]+) mathematical problems\*\*"),
+    "volumes": re.compile(r"volumes of (\d+) records \((\d+) in the final volume\)"),
+    "attribution": re.compile(r"The ([\d,]+) records with an \*\*Attribution basis\*\* row"),
+}
+# problems/README.md states that the index "preserves Lean evidence
+# qualifications" and quotes the shortened form below as the index wording,
+# while the detail table spells the same qualification out in full. A status
+# value is instead either stated alone or extended with " — " and its sources,
+# because the detail field "combines the proof status, source links, and
+# formalization contributor credits". Listing the qualification keeps the two
+# shapes apart rather than loosening the rule for every record.
+PROBLEM_LEAN_QUALIFICATION = {
+    "Reported; standalone source not located":
+        "Reported; standalone Lean source not located",
+}
+
 
 class InvalidRecord(ValueError):
     pass
@@ -382,9 +419,180 @@ def check_links(root):
                     require(unquote(parsed.fragment) in anchors[dest], f"{path}: broken heading anchor: {target}")
 
 
+def table_cells(line):
+    """Return the cells of a Markdown table row, or None for any other line."""
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return None
+    return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
+def problem_index(root):
+    """Read the index rows, the volume table and the volume section headings."""
+    volumes, rows, headings = [], [], []
+    for line in (root / PROBLEM_INDEX).read_text(encoding="utf-8").splitlines():
+        if line.startswith("### Problems "):
+            headings.append(line.removeprefix("### Problems ").strip())
+        cells = table_cells(line)
+        if cells is None:
+            continue
+        if len(cells) == 6 and PROBLEM_ID.fullmatch(cells[0]):
+            rows.append(cells)
+        elif len(cells) == 2 and PROBLEM_RANGE.match(cells[0]):
+            volumes.append(cells)
+    return volumes, rows, headings
+
+
+def problem_catalog(root, relative):
+    """Read one volume: record titles, detail fields and explicit anchors."""
+    records, order, anchors, current = {}, [], set(), None
+    for line in (root / relative).read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        anchor = PROBLEM_ANCHOR.match(stripped)
+        if anchor:
+            anchors.add(anchor.group(1))
+            continue
+        heading = PROBLEM_HEADING.match(stripped)
+        if heading:
+            current = heading.group(1)
+            records[current] = {"title": heading.group(2), "fields": {}}
+            order.append(current)
+            continue
+        cells = table_cells(line)
+        if cells and len(cells) == 2 and current and cells[0] != "Field":
+            records[current]["fields"].setdefault(cells[0], cells[1])
+    return records, order, anchors
+
+
+def problem_claims(text):
+    """Read the counts the index states about itself."""
+    def number(name, group=1):
+        match = PROBLEM_CLAIMS[name].search(text)
+        require(match, f"{PROBLEM_INDEX}: cannot read the documented {name} count")
+        return int(match.group(group).replace(",", ""))
+
+    return number("problems"), number("volumes"), number("volumes", 2), number("attribution")
+
+
+def check_problems(root):
+    """Assert the invariants problems/README.md states about the problem bank."""
+    root = root.resolve()
+    total, volume_size, final_volume, attribution = problem_claims(
+        (root / PROBLEM_INDEX).read_text(encoding="utf-8"))
+    volumes, rows, headings = problem_index(root)
+    require(len(volumes) == len(headings),
+            f"{PROBLEM_INDEX}: {len(volumes)} volume ranges but {len(headings)} section headings")
+
+    ranges = {}
+    for position, (cells, heading) in enumerate(zip(volumes, headings)):
+        require(heading == cells[0],
+                f"{PROBLEM_INDEX}: section heading {heading!r} does not match volume range {cells[0]!r}")
+        link = PROBLEM_FILE.match(cells[1])
+        require(link and link.group(1) == link.group(2),
+                f"{PROBLEM_INDEX}: volume {cells[0]} must link to one catalog file")
+        require(link.group(2) not in ranges,
+                f"{PROBLEM_INDEX}: {link.group(2)} is listed as more than one volume")
+        low, high = (int(part) for part in PROBLEM_RANGE.match(cells[0]).groups())
+        if position < len(volumes) - 1:
+            require(high - low + 1 == volume_size,
+                    f"{PROBLEM_INDEX}: volume {cells[0]} must hold {volume_size} problems")
+        ranges[link.group(2)] = (low, high)
+    spans = list(ranges.values())
+    require(sum(high - low + 1 for low, high in spans) == total,
+            f"{PROBLEM_INDEX}: the volume ranges must cover {total} problems")
+    require(spans and spans[-1][1] - spans[-1][0] + 1 == final_volume,
+            f"{PROBLEM_INDEX}: the final volume must hold {final_volume} problems")
+
+    catalogs = {relative: problem_catalog(root, f"problems/{relative}") for relative in ranges}
+
+    require(len(rows) == total,
+            f"{PROBLEM_INDEX}: the index states {total} problems but lists {len(rows)} rows")
+    consecutive = [f"JSP-{number:06d}" for number in range(1, total + 1)]
+    require([row[0] for row in rows] == consecutive,
+            f"{PROBLEM_INDEX}: the No. column must run consecutively from JSP-000001 to JSP-{total:06d}")
+
+    attributed, listed = 0, set()
+    for identifier, problem, status, lean, eligible, claim in rows:
+        number = int(identifier.removeprefix("JSP-"))
+        link = PROBLEM_LINK.match(problem)
+        require(link, f"{PROBLEM_INDEX}: {identifier} must link one problem title")
+        require(link.group(3) == identifier,
+                f"{PROBLEM_INDEX}: {identifier} must link to its own anchor, found {link.group(3)}")
+        low, high = ranges.get(link.group(2), (0, -1))
+        require(low <= number <= high,
+                f"{PROBLEM_INDEX}: {identifier} must link into the volume covering its number")
+        records, _, anchors = catalogs[link.group(2)]
+        require(identifier in records, f"{link.group(2)}: missing detail record for {identifier}")
+        require(identifier in anchors, f"{link.group(2)}: missing explicit anchor for {identifier}")
+        require(records[identifier]["title"] == link.group(1),
+                f"{PROBLEM_INDEX}: {identifier} title differs from the catalog heading")
+        listed.add(identifier)
+
+        require(status in PROBLEM_STATUS,
+                f"{PROBLEM_INDEX}: {identifier} Current status must be one of {', '.join(PROBLEM_STATUS)}")
+        require(eligible in PROBLEM_ELIGIBLE,
+                f"{PROBLEM_INDEX}: {identifier} Eligible to claim must be one of {', '.join(PROBLEM_ELIGIBLE)}")
+        require(claim in PROBLEM_CLAIM,
+                f"{PROBLEM_INDEX}: {identifier} Claim status must be one of {', '.join(PROBLEM_CLAIM)}")
+        # Documented: Yes marks records whose Current status is Solved and whose Lean proof is Yes.
+        # Pending verification is a screening judgement, so only Yes and No are derived here.
+        if eligible == "Yes":
+            require(status == "Solved" and lean == "Yes",
+                    f"{PROBLEM_INDEX}: {identifier} Eligible to claim is Yes but Current status is "
+                    f"{status!r} and Lean proof is {lean!r}")
+        elif eligible == "No":
+            require(not (status == "Solved" and lean == "Yes"),
+                    f"{PROBLEM_INDEX}: {identifier} Eligible to claim is No although Current status is "
+                    f"Solved and Lean proof is Yes")
+        # Documented: a claimable problem moves Unavailable -> Unclaimed -> Claimed.
+        require((claim == "Unavailable") == (eligible != "Yes"),
+                f"{PROBLEM_INDEX}: {identifier} Claim status {claim!r} contradicts Eligible to claim {eligible!r}")
+
+        fields = records[identifier]["fields"]
+        # Documented: every record displays its eligibility in both places.
+        require(fields.get("Eligible to claim") == eligible,
+                f"{link.group(2)}: {identifier} detail table must repeat Eligible to claim {eligible!r}")
+        # Documented: the index shows the status alone, and the detail field adds
+        # any complete-solution credits after the fixed "Proof contributors:"
+        # marker.  Those are the only two shapes, so a bare " — " scope note or a
+        # "Solved by …" attribution left over from an earlier presentation is
+        # rejected rather than accepted as a prefix match.
+        detail_status = fields.get("Current status", "")
+        require(detail_status == status
+                or detail_status.startswith(status + PROBLEM_PROOF_CREDITS),
+                f"{link.group(2)}: {identifier} detail Current status must be {status!r} or "
+                f"extend it with {PROBLEM_PROOF_CREDITS!r}, found {detail_status!r}")
+        # Documented: the detail field combines the proof status, source links and
+        # contributor credits, so a status is either stated alone or extended with
+        # " — ". A stale eligibility marker left behind by an earlier edit is
+        # neither, and is rejected here.
+        detail_lean = fields.get("Lean proof", "").split("<br>")[0].strip()
+        if lean in PROBLEM_LEAN_QUALIFICATION:
+            expected_lean = PROBLEM_LEAN_QUALIFICATION[lean]
+            require(detail_lean.startswith(expected_lean),
+                    f"{link.group(2)}: {identifier} detail Lean proof must begin with "
+                    f"{expected_lean!r}, found {detail_lean!r}")
+        else:
+            require(detail_lean == lean or detail_lean.startswith(lean + " — "),
+                    f"{link.group(2)}: {identifier} detail Lean proof must be {lean!r} or extend it "
+                    f"with ' — ', found {detail_lean!r}")
+        attributed += "Attribution basis" in fields
+
+    for relative, (records, order, _) in catalogs.items():
+        low, high = ranges[relative]
+        expected = [f"JSP-{number:06d}" for number in range(low, high + 1)]
+        require(order == expected,
+                f"{relative}: catalog records must run consecutively from JSP-{low:06d} to JSP-{high:06d}")
+        require(set(records) <= listed,
+                f"{relative}: records missing from the index: {sorted(set(records) - listed)}")
+    require(attributed == attribution,
+            f"{PROBLEM_INDEX}: the index states {attribution} records with an Attribution basis row, "
+            f"found {attributed}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "build", "check", "links", "history"))
+    parser.add_argument("command", choices=("validate", "build", "check", "links", "history", "problems"))
     parser.add_argument("--base", help="Full comparison commit for history checks")
     args = parser.parse_args()
     try:
@@ -393,6 +601,8 @@ def main():
             check_history(ROOT, args.base)
         elif args.command == "links":
             check_links(ROOT)
+        elif args.command == "problems":
+            check_problems(ROOT)
         elif args.command == "validate":
             collect(ROOT)
         else:
